@@ -1,14 +1,14 @@
 import os
 
+
 LLM_CONFIG = {
     "provider": "deepseek",
     "base_url": "https://api.deepseek.com",
-    "api_key":  "sk-31ed2ebd4cb84d2a9ee19321cdf38a6d",# 替换为真实密钥
+    "api_key":  os.getenv("LLM_API_KEY","sk-my_api_key"),# 替换为真实密钥
     "model": "deepseek-v4-flash",
     "temperature": 0.7,
     "max_tokens": 4096
 }
-
 SCORE_LEVELS = {
     (90, 100): "优秀",
     (80, 89): "良好",
