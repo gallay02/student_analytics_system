@@ -17,4 +17,8 @@ SCORE_LEVELS = {
     (0, 59): "待提高"
 }
 
-DB_PATH = "data/student_analytics.db"
+# 预设科目列表
+PRESET_SUBJECTS = ["语文", "数学", "英语", "物理", "化学", "生物", "历史", "地理", "政治", "信息技术"]
+
+# 数据库基础路径（用户隔离后动态生成）
+DB_BASE_PATH = "data"

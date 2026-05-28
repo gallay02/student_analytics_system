@@ -2,14 +2,23 @@ import sqlite3
 import pandas as pd
 import json
 import os
-from config import DB_PATH
-from datetime import datetime  # 添加这行
+import hashlib
+from datetime import datetime
+from config import DB_BASE_PATH
 
-def init_database():
-    os.makedirs("data", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+def get_user_db_path(user_id):
+    """获取用户专属数据库路径"""
+    user_folder = os.path.join(DB_BASE_PATH, f"user_{user_id}")
+    os.makedirs(user_folder, exist_ok=True)
+    return os.path.join(user_folder, "student_analytics.db")
+
+def init_database(db_path):
+    """初始化数据库（传入具体路径）"""
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
+    # 评价维度配置表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS evaluation_templates (
             template_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -22,6 +31,7 @@ def init_database():
         )
     ''')
     
+    # 学生表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS students (
             student_id TEXT PRIMARY KEY,
@@ -32,6 +42,32 @@ def init_database():
         )
     ''')
     
+    # 检查并添加缺失的 class_id 列
+    cursor.execute("PRAGMA table_info(students)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'class_id' not in columns:
+        cursor.execute('ALTER TABLE students ADD COLUMN class_id INTEGER')
+    
+    # 班级表（确保存在）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS classes (
+            class_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            class_name TEXT NOT NULL,
+            subject TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # 确保 custom_subjects 表存在（兼容旧数据库）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS custom_subjects (
+            subject_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject_name TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # 评价记录表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS evaluations (
             eval_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,11 +82,11 @@ def init_database():
             total_score REAL,
             comments TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (student_id) REFERENCES students(student_id),
-            FOREIGN KEY (template_id) REFERENCES evaluation_templates(template_id)
+            FOREIGN KEY (student_id) REFERENCES students(student_id)
         )
     ''')
     
+    # 学情快照表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS learning_status (
             status_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +101,7 @@ def init_database():
         )
     ''')
     
+    # 阶段总评表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS phase_evaluations (
             phase_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,22 +121,53 @@ def init_database():
         )
     ''')
     
+    # 用户账户表（用于登录验证）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_accounts (
+            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
-def import_students(df, subject):
-    conn = sqlite3.connect(DB_PATH)
+# 全局变量存储当前用户数据库路径
+_current_db_path = None
+
+def set_current_user(user_id):
+    """设置当前用户，切换数据库"""
+    global _current_db_path
+    _current_db_path = get_user_db_path(user_id)
+    init_database(_current_db_path)
+    return _current_db_path
+
+def get_db_path():
+    """获取当前数据库路径"""
+    global _current_db_path
+    if _current_db_path is None:
+        raise ValueError("未设置当前用户，请先调用 set_current_user()")
+    return _current_db_path
+
+# 以下所有函数都需要使用 get_db_path() 替代原来的 DB_PATH
+
+def import_students(df, subject, class_id=None):
+    conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
     for _, row in df.iterrows():
+        class_name = row.get('班级', '')
+        # 如果提供了class_id，使用它；否则使用导入的班级名称
         cursor.execute('''
-            INSERT OR REPLACE INTO students (student_id, name, class_name, subject)
-            VALUES (?, ?, ?, ?)
-        ''', (str(row['学号']), row['姓名'], row.get('班级', ''), subject))
+            INSERT OR REPLACE INTO students (student_id, name, class_name, class_id, subject)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (str(row['学号']), row['姓名'], class_name, class_id, subject))
     conn.commit()
     conn.close()
 
 def save_template(template_name, subject, dimensions, description="", created_by=""):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO evaluation_templates (template_name, subject, dimensions, description, created_by)
@@ -111,7 +179,7 @@ def save_template(template_name, subject, dimensions, description="", created_by
     return template_id
 
 def get_templates(subject=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path())
     query = "SELECT * FROM evaluation_templates"
     params = []
     if subject:
@@ -124,8 +192,27 @@ def get_templates(subject=None):
         df['dimensions'] = df['dimensions'].apply(json.loads)
     return df
 
+def delete_template(template_id):
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+    
+    # 检查是否有评价数据使用此模板
+    cursor.execute("SELECT COUNT(*) FROM evaluations WHERE template_id = ?", (template_id,))
+    count = cursor.fetchone()[0]
+    
+    if count > 0:
+        conn.close()
+        return False, f"该模板已被 {count} 条评价数据使用，无法删除"
+    
+    # 删除模板
+    cursor.execute("DELETE FROM evaluation_templates WHERE template_id = ?", (template_id,))
+    conn.commit()
+    conn.close()
+    return True, "模板删除成功"
+
+
 def get_template(template_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path())
     df = pd.read_sql_query("SELECT * FROM evaluation_templates WHERE template_id = ?", 
                            conn, params=[template_id])
     conn.close()
@@ -136,7 +223,7 @@ def get_template(template_id):
     return None
 
 def save_evaluation(eval_data):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO evaluations 
@@ -160,7 +247,7 @@ def save_evaluation(eval_data):
     return eval_id
 
 def get_student_evaluations(student_id, subject=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path())
     query = "SELECT * FROM evaluations WHERE student_id = ?"
     params = [student_id]
     if subject:
@@ -171,11 +258,13 @@ def get_student_evaluations(student_id, subject=None):
     conn.close()
     if not df.empty and 'scores_json' in df.columns:
         scores_df = df['scores_json'].apply(lambda x: json.loads(x) if pd.notna(x) else {}).apply(pd.Series)
+        scores_df = scores_df.apply(pd.to_numeric, errors='coerce').fillna(0)
+        scores_df = scores_df.apply(lambda x: x.where((x >= 0) & (x <= 100), 0))
         df = pd.concat([df.drop('scores_json', axis=1), scores_df], axis=1)
     return df
 
 def get_class_evaluations(lesson_id=None, subject=None, template_id=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path())
     query = "SELECT e.*, s.name FROM evaluations e JOIN students s ON e.student_id = s.student_id WHERE 1=1"
     params = []
     if lesson_id:
@@ -192,12 +281,13 @@ def get_class_evaluations(lesson_id=None, subject=None, template_id=None):
     conn.close()
     if not df.empty and 'scores_json' in df.columns:
         scores_df = df['scores_json'].apply(lambda x: json.loads(x) if pd.notna(x) else {}).apply(pd.Series)
+        scores_df = scores_df.apply(pd.to_numeric, errors='coerce').fillna(0)
+        scores_df = scores_df.apply(lambda x: x.where((x >= 0) & (x <= 100), 0))
         df = pd.concat([df.drop('scores_json', axis=1), scores_df], axis=1)
     return df
 
 def save_learning_status(status_data):
-    """保存学情快照"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO learning_status 
@@ -210,13 +300,13 @@ def save_learning_status(status_data):
         status_data['pre_lesson_status'],
         status_data['risk_level'],
         status_data['suggested_focus'],
-        datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # 必须是这行，不是 pd.Timestamp.now()
+        datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     ))
     conn.commit()
     conn.close()
 
 def save_phase_evaluation(phase_data):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO phase_evaluations 
@@ -239,4 +329,121 @@ def save_phase_evaluation(phase_data):
     conn.commit()
     conn.close()
 
-init_database()
+# 自定义科目管理
+def save_custom_subject(subject_name):
+    """保存用户自定义科目"""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+    try:
+        cursor.execute('INSERT INTO custom_subjects (subject_name) VALUES (?)', (subject_name,))
+        conn.commit()
+        success = True
+    except sqlite3.IntegrityError:
+        success = False  # 已存在
+    conn.close()
+    return success
+
+def get_custom_subjects():
+    """获取用户自定义科目列表"""
+    conn = sqlite3.connect(get_db_path())
+    df = pd.read_sql_query("SELECT subject_name FROM custom_subjects ORDER BY created_at", conn)
+    conn.close()
+    return df['subject_name'].tolist() if not df.empty else []
+
+def delete_custom_subject(subject_name):
+    """删除用户自定义科目"""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM custom_subjects WHERE subject_name = ?', (subject_name,))
+    conn.commit()
+    conn.close()
+
+# ============ 用户认证相关函数 ============
+def register_user(username, password):
+    """注册新用户"""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    try:
+        cursor.execute('INSERT INTO user_accounts (username, password_hash) VALUES (?, ?)', 
+                      (username, password_hash))
+        conn.commit()
+        success = True
+    except sqlite3.IntegrityError:
+        success = False  # 用户名已存在
+    conn.close()
+    return success
+
+def authenticate_user(username, password):
+    """验证用户登录"""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    cursor.execute('SELECT * FROM user_accounts WHERE username = ? AND password_hash = ?', 
+                  (username, password_hash))
+    user = cursor.fetchone()
+    conn.close()
+    return user is not None
+
+def user_exists(username):
+    """检查用户名是否存在"""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM user_accounts WHERE username = ?', (username,))
+    user = cursor.fetchone()
+    conn.close()
+    return user is not None
+
+# ============ 班级管理相关函数 ============
+def save_class(class_name, subject):
+    """保存班级"""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+    try:
+        cursor.execute('INSERT INTO classes (class_name, subject) VALUES (?, ?)', 
+                      (class_name, subject))
+        conn.commit()
+        class_id = cursor.lastrowid
+        success = True
+    except sqlite3.IntegrityError:
+        success = False
+        class_id = None
+    conn.close()
+    return success, class_id
+
+def get_classes(subject=None):
+    """获取班级列表"""
+    conn = sqlite3.connect(get_db_path())
+    query = "SELECT * FROM classes"
+    params = []
+    if subject:
+        query += " WHERE subject = ?"
+        params.append(subject)
+    query += " ORDER BY created_at"
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
+
+def get_class_by_id(class_id):
+    """根据ID获取班级信息"""
+    conn = sqlite3.connect(get_db_path())
+    df = pd.read_sql_query("SELECT * FROM classes WHERE class_id = ?", conn, params=[class_id])
+    conn.close()
+    if not df.empty:
+        return df.iloc[0].to_dict()
+    return None
+
+def delete_class(class_id):
+    """删除班级"""
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM classes WHERE class_id = ?', (class_id,))
+    conn.commit()
+    conn.close()
+
+def get_students_by_class(class_id):
+    """根据班级ID获取学生列表"""
+    conn = sqlite3.connect(get_db_path())
+    df = pd.read_sql_query("SELECT * FROM students WHERE class_id = ?", conn, params=[class_id])
+    conn.close()
+    return df
